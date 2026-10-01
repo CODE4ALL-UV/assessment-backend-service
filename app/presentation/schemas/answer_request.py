@@ -1,1 +1,0 @@
-# an answer request schema for validating answer creation requests

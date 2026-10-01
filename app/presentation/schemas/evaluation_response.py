@@ -1,1 +1,0 @@
-# evaluation response schema for validating course responses
