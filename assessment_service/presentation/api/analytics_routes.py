@@ -9,12 +9,15 @@ estudiante. Para saber qué tema cuesta más no hace falta más que eso, y no
 guardar lo innecesario es lo correcto.
 
 Quién ve qué: el estudiante solo puede registrar lo suyo; los resúmenes de
-todo el curso son solo para docentes.
+un curso son para su docente y para la coordinación.
+
+Todo es de un curso. Lo que llega sin `course_id` es del Curso general, como
+todo lo que se guardó antes de que hubiera cursos por docente.
 """
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import Integer, func
 from sqlalchemy.exc import IntegrityError
@@ -23,10 +26,17 @@ from sqlalchemy.orm import Session
 from neon_storage import get_db
 from neon_storage.models import (
     ActivityCompletion,
+    CourseEnrollment,
     QuizAnswer,
     Usuario,
 )
 
+from course_content_service.access import (
+    DIRECTOR,
+    require_students_view,
+    require_view,
+    resolve_course,
+)
 from user_management_service.auth import Caller, current_caller, require_course_editor
 
 router = APIRouter(prefix="/api/analytics", tags=["Analítica"])
@@ -70,6 +80,7 @@ class AttemptIn(BaseModel):
     section_id: str
     activity: str
     answers: list[AnswerIn]
+    course_id: Optional[int] = None
 
 
 @router.post("/attempts", status_code=status.HTTP_201_CREATED)
@@ -105,10 +116,15 @@ def record_attempt(
             detail="Demasiadas respuestas en un solo intento.",
         )
 
+    # Solo en un curso que el estudiante pueda ver: si no, cualquiera podría
+    # llenar de respuestas falsas las estadísticas de otro docente.
+    course = require_view(db, resolve_course(db, payload.course_id), caller)
+
     for answer in payload.answers:
         db.add(
             QuizAnswer(
                 usuario_id=caller.user_id,
+                course_id=course.id,
                 section_id=payload.section_id.strip(),
                 activity=payload.activity,
                 question_index=answer.question_index,
@@ -141,6 +157,7 @@ def record_attempt(
 class CompletionIn(BaseModel):
     section_id: str
     activity: str
+    course_id: Optional[int] = None
 
 
 @router.post("/completions", status_code=status.HTTP_200_OK)
@@ -167,11 +184,13 @@ def record_completion(
         )
 
     section_id = payload.section_id.strip()
+    course = require_view(db, resolve_course(db, payload.course_id), caller)
 
     existing = (
         db.query(ActivityCompletion)
         .filter(
             ActivityCompletion.usuario_id == caller.user_id,
+            ActivityCompletion.course_id == course.id,
             ActivityCompletion.section_id == section_id,
             ActivityCompletion.activity == payload.activity,
         )
@@ -183,6 +202,7 @@ def record_completion(
     db.add(
         ActivityCompletion(
             usuario_id=caller.user_id,
+            course_id=course.id,
             section_id=section_id,
             activity=payload.activity,
         )
@@ -200,10 +220,31 @@ def record_completion(
     return {"recorded": True}
 
 
+def _course_scope(db: Session, course_id: Optional[int], caller: Caller) -> Optional[int]:
+    """De qué curso son las cifras que se piden.
+
+    El docente pide las de uno de sus cursos. La coordinación puede pedir las
+    de cualquiera, o no pedir ninguno y ver todo junto (devuelve None).
+    """
+    if course_id is None and caller.role == DIRECTOR:
+        return None
+    if course_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Di de qué curso quieres ver los datos (course_id).",
+        )
+    return require_students_view(resolve_course(db, course_id), caller).id
+
+
+def _in_course(query, column, course_id: Optional[int]):
+    return query if course_id is None else query.filter(column == course_id)
+
+
 @router.get("/summary")
 def summary(
+    course_id: Optional[int] = Query(default=None),
     db: Session = Depends(get_db),
-    _teacher: Caller = Depends(require_course_editor),
+    caller: Caller = Depends(require_course_editor),
 ):
     """Cómo va el curso, sección por sección y pregunta por pregunta.
 
@@ -211,16 +252,25 @@ def summary(
     estado normal al principio. No es un error, y conviene que la pantalla lo
     diga así en vez de enseñar ceros que parecen datos.
     """
-    total = db.query(func.count(QuizAnswer.id)).scalar() or 0
+    scope = _course_scope(db, course_id, caller)
+
+    total = (
+        _in_course(db.query(func.count(QuizAnswer.id)), QuizAnswer.course_id, scope).scalar()
+        or 0
+    )
 
     # --- por sección --------------------------------------------------------
     por_seccion = (
-        db.query(
-            QuizAnswer.section_id,
-            func.count(QuizAnswer.id).label("total"),
-            func.sum(func.cast(QuizAnswer.correct, Integer)).label("aciertos"),
-            func.count(func.distinct(QuizAnswer.usuario_id)).label("estudiantes"),
-            func.avg(QuizAnswer.elapsed_ms).label("tiempo"),
+        _in_course(
+            db.query(
+                QuizAnswer.section_id,
+                func.count(QuizAnswer.id).label("total"),
+                func.sum(func.cast(QuizAnswer.correct, Integer)).label("aciertos"),
+                func.count(func.distinct(QuizAnswer.usuario_id)).label("estudiantes"),
+                func.avg(QuizAnswer.elapsed_ms).label("tiempo"),
+            ),
+            QuizAnswer.course_id,
+            scope,
         )
         .group_by(QuizAnswer.section_id)
         .all()
@@ -248,14 +298,18 @@ def summary(
 
     # --- por pregunta -------------------------------------------------------
     por_pregunta = (
-        db.query(
-            QuizAnswer.section_id,
-            QuizAnswer.activity,
-            QuizAnswer.question_index,
-            func.max(QuizAnswer.prompt).label("prompt"),
-            func.count(QuizAnswer.id).label("total"),
-            func.sum(func.cast(QuizAnswer.correct, Integer)).label("aciertos"),
-            func.avg(QuizAnswer.elapsed_ms).label("tiempo"),
+        _in_course(
+            db.query(
+                QuizAnswer.section_id,
+                QuizAnswer.activity,
+                QuizAnswer.question_index,
+                func.max(QuizAnswer.prompt).label("prompt"),
+                func.count(QuizAnswer.id).label("total"),
+                func.sum(func.cast(QuizAnswer.correct, Integer)).label("aciertos"),
+                func.avg(QuizAnswer.elapsed_ms).label("tiempo"),
+            ),
+            QuizAnswer.course_id,
+            scope,
         )
         .group_by(
             QuizAnswer.section_id,
@@ -290,10 +344,14 @@ def summary(
 
     # --- que actividades se terminan ---------------------------------------
     por_actividad = (
-        db.query(
-            ActivityCompletion.section_id,
-            ActivityCompletion.activity,
-            func.count(ActivityCompletion.id).label("total"),
+        _in_course(
+            db.query(
+                ActivityCompletion.section_id,
+                ActivityCompletion.activity,
+                func.count(ActivityCompletion.id).label("total"),
+            ),
+            ActivityCompletion.course_id,
+            scope,
         )
         .group_by(ActivityCompletion.section_id, ActivityCompletion.activity)
         .all()
@@ -308,9 +366,15 @@ def summary(
         for row in por_actividad
     ]
 
-    total_completions = db.query(func.count(ActivityCompletion.id)).scalar() or 0
+    total_completions = (
+        _in_course(
+            db.query(func.count(ActivityCompletion.id)), ActivityCompletion.course_id, scope
+        ).scalar()
+        or 0
+    )
 
     return {
+        "course_id": scope,
         "total_answers": total,
         "total_completions": int(total_completions),
         "sections": sections,
@@ -321,20 +385,24 @@ def summary(
 
 @router.get("/students")
 def students(
+    course_id: Optional[int] = Query(default=None),
     db: Session = Depends(get_db),
-    _teacher: Caller = Depends(require_course_editor),
+    caller: Caller = Depends(require_course_editor),
 ):
-    """Los estudiantes y cómo les está yendo.
+    """Los estudiantes de un curso y cómo les está yendo.
 
-    Salen todos, también quien no ha respondido nada: justo esos son los que
-    el docente necesita ver.
+    Salen todos los del curso, también quien no ha respondido nada: justo
+    esos son los que el docente necesita ver. En el Curso general son todos
+    los estudiantes, porque todos lo tienen sin inscribirse.
     """
-    alumnos = (
-        db.query(Usuario)
-        .filter(func.lower(Usuario.rol) == "estudiante")
-        .order_by(Usuario.nombre)
-        .all()
-    )
+    scope = _course_scope(db, course_id, caller)
+
+    alumnos_q = db.query(Usuario).filter(func.lower(Usuario.rol) == "estudiante")
+    if scope is not None and not resolve_course(db, scope).is_general:
+        alumnos_q = alumnos_q.join(
+            CourseEnrollment, CourseEnrollment.student_id == Usuario.id_usuario
+        ).filter(CourseEnrollment.course_id == scope)
+    alumnos = alumnos_q.order_by(Usuario.nombre).all()
 
     stats = dict(
         (
@@ -345,11 +413,15 @@ def students(
                 "sections": int(row.secciones or 0),
             },
         )
-        for row in db.query(
-            QuizAnswer.usuario_id,
-            func.count(QuizAnswer.id).label("total"),
-            func.sum(func.cast(QuizAnswer.correct, Integer)).label("aciertos"),
-            func.count(func.distinct(QuizAnswer.section_id)).label("secciones"),
+        for row in _in_course(
+            db.query(
+                QuizAnswer.usuario_id,
+                func.count(QuizAnswer.id).label("total"),
+                func.sum(func.cast(QuizAnswer.correct, Integer)).label("aciertos"),
+                func.count(func.distinct(QuizAnswer.section_id)).label("secciones"),
+            ),
+            QuizAnswer.course_id,
+            scope,
         )
         .group_by(QuizAnswer.usuario_id)
         .all()
@@ -357,9 +429,13 @@ def students(
 
     hechas = dict(
         (row.usuario_id, int(row.total or 0))
-        for row in db.query(
-            ActivityCompletion.usuario_id,
-            func.count(ActivityCompletion.id).label("total"),
+        for row in _in_course(
+            db.query(
+                ActivityCompletion.usuario_id,
+                func.count(ActivityCompletion.id).label("total"),
+            ),
+            ActivityCompletion.course_id,
+            scope,
         )
         .group_by(ActivityCompletion.usuario_id)
         .all()
@@ -385,22 +461,25 @@ def students(
             }
         )
 
-    return {"count": len(out), "students": out}
+    return {"course_id": scope, "count": len(out), "students": out}
 
 
 @router.delete("/attempts")
 def clear_attempts(
     section_id: Optional[str] = None,
+    course_id: Optional[int] = Query(default=None),
     db: Session = Depends(get_db),
-    _teacher: Caller = Depends(require_course_editor),
+    caller: Caller = Depends(require_course_editor),
 ):
-    """Borra lo registrado, entero o de una sección.
+    """Borra lo registrado en un curso, entero o de una sección.
 
     Sirve para limpiar los datos de una prueba antes de empezar un curso de
-    verdad. Borra respuestas de estudiantes, así que solo un docente puede.
+    verdad. Borra respuestas de estudiantes, así que solo puede su docente, y
+    solo en su curso. Sin curso (todo de todos) solo la coordinación.
     """
-    answers = db.query(QuizAnswer)
-    done = db.query(ActivityCompletion)
+    scope = _course_scope(db, course_id, caller)
+    answers = _in_course(db.query(QuizAnswer), QuizAnswer.course_id, scope)
+    done = _in_course(db.query(ActivityCompletion), ActivityCompletion.course_id, scope)
     if section_id:
         answers = answers.filter(QuizAnswer.section_id == section_id)
         done = done.filter(ActivityCompletion.section_id == section_id)
