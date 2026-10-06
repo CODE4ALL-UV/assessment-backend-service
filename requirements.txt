@@ -6,3 +6,4 @@ pydantic
 sqlalchemy
 pytest
 pytest-cov
+httpx2
