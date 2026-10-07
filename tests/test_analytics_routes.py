@@ -1,4 +1,4 @@
-"""Las respuestas de los estudiantes y el resumen para el docente, curso a curso."""
+"""Las respuestas de los estudiantes y el resumen para el docente, curso a curso..."""
 
 import uuid
 
