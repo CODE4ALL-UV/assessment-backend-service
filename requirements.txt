@@ -7,3 +7,4 @@ sqlalchemy
 pytest
 pytest-cov
 httpx2
+python-dotenv
